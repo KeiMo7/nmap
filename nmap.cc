@@ -637,6 +637,9 @@ void parse_options(int argc, char **argv) {
     {"script-args-file", required_argument, 0, 0},
     {"script-help", required_argument, 0, 0},
     {"script-timeout", required_argument, 0, 0},
+    {"script-runtime-reuse", no_argument, 0, 0},
+    {"script-runtime-idle-timeout", required_argument, 0, 0},
+    {"script-runtime-state", required_argument, 0, 0},
 #endif
     {"ip-options", required_argument, 0, 0},
     {"min-rate", required_argument, 0, 0},
@@ -693,6 +696,22 @@ void parse_options(int argc, char **argv) {
         if (d < 0 || d > LONG_MAX)
           fatal("Bogus --script-timeout argument specified");
         delayed_options.pre_scripttimeout = d;
+      } else if (strcmp(long_options[option_index].name, "script-runtime-reuse") == 0) {
+        o.script_runtime_reuse = true;
+      } else if (strcmp(long_options[option_index].name, "script-runtime-idle-timeout") == 0) {
+        d = tval2secs(optarg);
+        if (d < 0 || d > LONG_MAX)
+          fatal("Bogus --script-runtime-idle-timeout argument specified");
+        o.script_runtime_idle_timeout = d;
+      } else if (strcmp(long_options[option_index].name, "script-runtime-state") == 0) {
+        if (strcmp(optarg, "auto") == 0)
+          o.script_runtime_state = 0;
+        else if (strcmp(optarg, "session") == 0)
+          o.script_runtime_state = 1;
+        else if (strcmp(optarg, "invocation") == 0)
+          o.script_runtime_state = 2;
+        else
+          fatal("Bogus --script-runtime-state argument specified (auto, session, or invocation)");
       } else
 #endif
         if (strcmp(long_options[option_index].name, "max-os-tries") == 0) {

@@ -321,6 +321,9 @@ class NmapOps {
   bool scriptupdatedb;
   bool scripthelp;
   double scripttimeout;
+  bool script_runtime_reuse;
+  double script_runtime_idle_timeout;
+  int script_runtime_state; /* 0=auto, 1=session, 2=invocation */
   void chooseScripts(char* argument);
   std::vector<std::string> chosenScripts;
 #endif

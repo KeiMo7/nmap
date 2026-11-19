@@ -459,6 +459,14 @@ static void open_cnse (lua_State *L)
   nseU_setsfield(L, -1, "scriptargsfile", o.scriptargsfile);
   nseU_setsfield(L, -1, "NMAP_URL", NMAP_URL);
   nseU_setnfield(L, -1, "script_timeout", o.scripttimeout);
+  nseU_setbfield(L, -1, "runtime_reuse", o.script_runtime_reuse);
+  nseU_setnfield(L, -1, "runtime_idle_timeout", o.script_runtime_idle_timeout);
+  if (o.script_runtime_state == 1)
+    nseU_setsfield(L, -1, "runtime_state", "session");
+  else if (o.script_runtime_state == 2)
+    nseU_setsfield(L, -1, "runtime_state", "invocation");
+  else
+    nseU_setsfield(L, -1, "runtime_state", "auto");
 
   luaL_newmetatable(L, "ScanProgressMeter");
   lua_pushcfunction(L, ScanProgressMeter_gc);

@@ -1372,6 +1372,20 @@ details of how different return values are handled.
             </para>
           </listitem>
         </varlistentry>
+
+        <varlistentry>
+          <term><literal>state_scope</literal></term>
+          <listitem>
+            <para>
+              Optional. Controls how script globals behave when runtime reuse
+              is enabled. <literal>"auto"</literal> is the default and falls
+              back to isolated execution if a global changes.
+              <literal>"session"</literal> explicitly opts in to retaining
+              script state for the scan session. <literal>"invocation"</literal>
+              requests a fresh script environment for every call.
+            </para>
+          </listitem>
+        </varlistentry>
       </variablelist>
       <para>
         This is an example of a debug code that uses the previous

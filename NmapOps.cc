@@ -327,6 +327,9 @@ void NmapOps::Initialize() {
   scriptupdatedb = false;
   scripthelp = false;
   scripttimeout = 0;
+  script_runtime_reuse = false;
+  script_runtime_idle_timeout = 60;
+  script_runtime_state = 0;
   chosenScripts.clear();
 #endif
   memset(&sourcesock, 0, sizeof(sourcesock));

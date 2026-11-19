@@ -99,6 +99,7 @@ local yield = coroutine.yield;
 local wrap = coroutine.wrap;
 
 local debug = require "debug";
+local getupvalue = debug.getupvalue;
 local traceback = debug.traceback;
 local _R = debug.getregistry();
 
@@ -132,6 +133,22 @@ local unpack = table.unpack;
 local os = require "os"
 local time = os.time
 local difftime = os.difftime
+
+-- Runtime reuse is opt-in. The default path below is deliberately the same as
+-- the historical one-environment-per-invocation behavior.
+local RUNTIME_REUSE = cnse.runtime_reuse;
+local RUNTIME_IDLE_TIMEOUT = cnse.runtime_idle_timeout or 0;
+local RUNTIME_STATE = cnse.runtime_state or "auto";
+local runtime_stats = {
+  acquisitions = 0,
+  hits = 0,
+  misses = 0,
+  initializations = 0,
+  reclaimed = 0,
+  fallbacks = 0,
+  execution_failures = 0,
+  timeouts = 0,
+};
 
 do -- Add loader to look in nselib/?.lua (nselib/ can be in multiple places)
   local function loader (lib)
@@ -176,6 +193,17 @@ local stdnse = require "stdnse";
 local strict = require "strict";
 assert(_ENV == _G);
 strict(_ENV);
+
+local shared_tables = setmetatable({}, {__mode = "k"})
+shared_tables[_G] = true
+local function mark_shared_tables ()
+  for _, module in pairs(package.loaded) do
+    if type(module) == "table" then
+      shared_tables[module] = true
+    end
+  end
+end
+mark_shared_tables()
 
 local script_database_type, script_database_path =
     cnse.fetchfile_absolute(cnse.script_dbpath);
@@ -252,6 +280,325 @@ end
 
 local function table_size (t)
   local n = 0; for _ in pairs(t) do n = n + 1; end return n;
+end
+
+-- A deterministic, bounded fingerprint of the script environment. It is used
+-- only in the "auto" state mode to notice when a script writes state that
+-- cannot safely survive a runtime hand-off.
+local function fingerprint_value (value, seen, depth, state)
+  if state.remaining <= 0 then
+    return "<budget>"
+  end
+  state.remaining = state.remaining - 1;
+
+  local value_type = type(value)
+  if value_type == "nil" then
+    return "nil"
+  elseif value_type == "string" then
+    return "string:"..tostring(#value)..":"..value
+  elseif value_type == "number" or value_type == "boolean" then
+    return value_type..":"..tostring(value)
+  elseif value_type == "function" then
+    local parts = {}
+    local i = 1
+    while true do
+      local name, upvalue = getupvalue(value, i)
+      if not name then
+        break
+      end
+      if name ~= "_ENV" and type(upvalue) ~= "function" and
+          not (type(upvalue) == "table" and shared_tables[upvalue]) then
+        parts[#parts+1] = name.."="..
+            fingerprint_value(upvalue, seen, depth + 1, state)
+      end
+      i = i + 1
+    end
+    sort(parts)
+    return "function:"..tostring(value).."{"..concat(parts, ";").."}"
+  elseif value_type ~= "table" then
+    return value_type..":"..tostring(value)
+  end
+
+  if seen[value] then
+    return "<cycle>"
+  end
+  if depth >= 8 then
+    return "<depth>"
+  end
+
+  seen[value] = true
+  local entries = {}
+  for key, child in pairs(value) do
+    local key_repr = type(key)..":"..tostring(key)
+    entries[#entries+1] = key_repr.."="..
+        fingerprint_value(child, seen, depth + 1, state)
+  end
+  sort(entries)
+  seen[value] = nil
+  return "{"..concat(entries, ";").."}"
+end
+
+local function runtime_state_fingerprint (runtime)
+  local function fingerprint ()
+    local parts = {}
+    local seen = {}
+    local state = {remaining = 2048}
+    if runtime.tracking then
+      for key, value in pairs(runtime.tracking.store) do
+        if type(value) ~= "function" then
+          parts[#parts+1] = type(key)..":"..tostring(key).."="..
+              fingerprint_value(value, seen, 0, state)
+        end
+      end
+    end
+    for _, name in ipairs({"prerule", "hostrule", "portrule", "postrule", "action"}) do
+      local value = runtime.env[name]
+      if type(value) == "function" then
+        parts[#parts+1] = name.."="..
+            fingerprint_value(value, seen, 0, state)
+      end
+    end
+    sort(parts)
+    return concat(parts, ";")
+  end
+
+  local ok, result = pcall(fingerprint)
+  if ok then
+    return result
+  end
+  print_debug(2, "NSE runtime fingerprint error: script=%s error=%s",
+      runtime.script.short_basename, tostring(result))
+  return nil
+end
+
+local metadata_globals = {
+  SCRIPT_NAME = true,
+  SCRIPT_PATH = true,
+  SCRIPT_TYPE = true,
+  author = true,
+  categories = true,
+  dependencies = true,
+  description = true,
+  license = true,
+  state_scope = true,
+}
+
+local function runtime_has_mutable_state (runtime)
+  if not runtime.tracking then
+    return false
+  end
+  for key, value in pairs(runtime.tracking.store) do
+    if type(value) == "table" and not metadata_globals[key] then
+      return true
+    end
+  end
+
+  for _, name in ipairs({"prerule", "hostrule", "portrule", "postrule", "action"}) do
+    local value = runtime.env[name]
+    if type(value) == "function" then
+      local i = 1
+      while true do
+        local upvalue_name, upvalue = getupvalue(value, i)
+        if not upvalue_name then
+          break
+        end
+        if upvalue_name ~= "_ENV" and type(upvalue) ~= "function" and
+            not (type(upvalue) == "table" and shared_tables[upvalue]) then
+          return true
+        end
+        i = i + 1
+      end
+    end
+  end
+  return false
+end
+
+local format_table
+
+local function output_signature (tab, str)
+  if str ~= nil then
+    return "string:"..tostring(str)
+  elseif tab == nil then
+    return "nil"
+  end
+  local ok, rendered = pcall(format_table, tab)
+  if ok then
+    return "table:"..tostring(rendered)
+  end
+  return "table:"..type(tab)
+end
+
+local runtime_pools = {}
+
+local RuntimePool = {}
+RuntimePool.__index = RuntimePool
+
+function RuntimePool.new (script, script_type)
+  local pool = setmetatable({
+    script = script,
+    script_type = script_type,
+    runtimes = {},
+  }, RuntimePool)
+  runtime_pools[#runtime_pools+1] = pool
+  return pool
+end
+
+function RuntimePool:destroy_runtime (runtime)
+  runtime.env = nil
+  runtime.prepared = false
+  runtime.retired = true
+end
+
+function RuntimePool:sweep ()
+  if RUNTIME_IDLE_TIMEOUT <= 0 then
+    return
+  end
+  local now = time()
+  for i = #self.runtimes, 1, -1 do
+    local runtime = self.runtimes[i]
+    if runtime.refs == 0 and not runtime.retired and
+        now - runtime.last_used >= RUNTIME_IDLE_TIMEOUT then
+      local idle = now - runtime.last_used
+      self:destroy_runtime(runtime)
+      remove(self.runtimes, i)
+      runtime_stats.reclaimed = runtime_stats.reclaimed + 1
+      print_verbose(1, "NSE runtime reclaimed: script=%s type=%s idle=%ds",
+          self.script.short_basename, self.script_type, idle)
+    end
+  end
+end
+
+function RuntimePool:create_runtime ()
+  local env, tracking = self.script:new_env(self.script_type,
+      self.script:runtime_mode() == "auto")
+  local runtime = {
+    env = env,
+    last_used = time(),
+    output_order = {},
+    outputs = {},
+    pool = self,
+    prepared = false,
+    refs = 1,
+    reusable = true,
+    retired = false,
+    script = self.script,
+    script_type = self.script_type,
+    tracking = tracking,
+    uses = 1,
+  }
+  self.runtimes[#self.runtimes+1] = runtime
+  return runtime
+end
+
+function RuntimePool:acquire ()
+  self:sweep()
+  for _, runtime in ipairs(self.runtimes) do
+    if runtime.refs == 0 and not runtime.retired then
+      runtime.refs = 1
+      runtime.last_used = time()
+      runtime.uses = runtime.uses + 1
+      runtime_stats.hits = runtime_stats.hits + 1
+      return runtime
+    end
+  end
+
+  runtime_stats.misses = runtime_stats.misses + 1
+  return self:create_runtime()
+end
+
+function RuntimePool:release (runtime, close_info)
+  if runtime.refs ~= 0 then
+    return
+  end
+
+  local isolation_reason
+  print_debug(2, "NSE runtime release: script=%s type=%s prepared=%s reusable=%s mode=%s dirty=%s",
+      self.script.short_basename, self.script_type, tostring(runtime.prepared),
+      tostring(runtime.reusable), self.script:runtime_mode(),
+      tostring(runtime.tracking and runtime.tracking.dirty))
+  if runtime.reusable and not runtime.retired and
+      self.script:runtime_mode() == "auto" then
+    if runtime.tracking and runtime.tracking.dirty then
+      isolation_reason = "script global state changed between invocations"
+    elseif runtime.prepared and runtime.needs_state_fingerprint and runtime.baseline then
+      local current = runtime_state_fingerprint(runtime)
+      print_debug(2, "NSE runtime fingerprint match: script=%s match=%s",
+          self.script.short_basename, tostring(current == runtime.baseline))
+      if current == nil then
+        isolation_reason = "could not fingerprint script state"
+      elseif current ~= runtime.baseline then
+        isolation_reason = "script state changed between invocations"
+      end
+    end
+    if not isolation_reason and close_info and
+        close_info.output_key and close_info.output_signature then
+      local previous = runtime.outputs[close_info.output_key]
+      if previous ~= nil and previous ~= close_info.output_signature then
+        isolation_reason = "same invocation produced different output"
+      else
+        runtime.outputs[close_info.output_key] = close_info.output_signature
+        runtime.output_order[#runtime.output_order+1] = close_info.output_key
+        if #runtime.output_order > 256 then
+          local oldest = remove(runtime.output_order, 1)
+          runtime.outputs[oldest] = nil
+        end
+      end
+    end
+  end
+
+  if isolation_reason then
+    self.script:fallback_to_isolation(isolation_reason)
+  end
+
+  if not runtime.reusable or not runtime.prepared or runtime.retired or
+      self.script.runtime_isolated then
+    self:destroy_runtime(runtime)
+    for i = #self.runtimes, 1, -1 do
+      if self.runtimes[i] == runtime then
+        remove(self.runtimes, i)
+        break
+      end
+    end
+  else
+    if close_info and close_info.timed_out then
+      print_debug(1, "NSE runtime retained after timeout: script=%s type=%s",
+          self.script.short_basename, self.script_type)
+    elseif close_info and close_info.failed then
+      print_debug(1, "NSE runtime retained after failure: script=%s type=%s",
+          self.script.short_basename, self.script_type)
+    end
+    runtime.last_used = time()
+  end
+end
+
+function RuntimePool:retire_idle ()
+  for i = #self.runtimes, 1, -1 do
+    local runtime = self.runtimes[i]
+    if runtime.refs == 0 then
+      self:destroy_runtime(runtime)
+      remove(self.runtimes, i)
+    end
+  end
+end
+
+local function sweep_all_runtimes ()
+  for _, pool in ipairs(runtime_pools) do
+    pool:sweep()
+  end
+end
+
+local function print_runtime_stats ()
+  if not RUNTIME_REUSE then
+    return
+  end
+  local attempts = runtime_stats.hits + runtime_stats.misses
+  local hit_rate = attempts > 0 and (runtime_stats.hits * 100 / attempts) or 0
+  print_verbose(1,
+      "NSE runtime reuse: hits=%d misses=%d hit_rate=%.1f%% initializations=%d reclaimed=%d fallbacks=%d failures=%d timeouts=%d",
+      runtime_stats.hits, runtime_stats.misses, hit_rate,
+      runtime_stats.initializations, runtime_stats.reclaimed,
+      runtime_stats.fallbacks, runtime_stats.execution_failures,
+      runtime_stats.timeouts)
 end
 
 local function loadscript (filename)
@@ -346,6 +693,33 @@ local Thread = {};
 -- Thread:new_worker. It (currently) has no methods.
 local Worker = {};
 do
+  local function release_thread_runtime (thread)
+    if thread.runtime_released or not thread.runtime then
+      return
+    end
+    thread.runtime_released = true
+
+    local runtime = thread.runtime
+    runtime.refs = runtime.refs - 1
+    if not thread.worker and runtime.reusable then
+      runtime.close_info = {
+        failed = thread.error ~= nil,
+        output_key = thread.invocation_key,
+        output_signature = thread.output_signature,
+        timed_out = rawget(thread, "timed_out") == true,
+      }
+    end
+    if runtime.refs <= 0 then
+      if runtime.pool then
+        runtime.pool:release(runtime, runtime.close_info)
+      else
+        runtime.env = nil
+        runtime.prepared = false
+        runtime.retired = true
+      end
+    end
+  end
+
   -- Workers reference data from parent thread.
   function Worker:__index (key)
     return Worker[key] or self.parent[key]
@@ -397,6 +771,9 @@ do
         cnse.host_set_output(self.host, self.id, tab, str);
       elseif self.type == "portrule" then
         cnse.port_set_output(self.host, self.port, self.id, tab, str);
+      end
+      if RUNTIME_REUSE and self.runtime and self.runtime.reusable then
+        self.output_signature = output_signature(tab, str)
       end
     end
   end
@@ -459,6 +836,105 @@ do
       destructor_t.destructor(destructor_t.thread, key);
       ch[key] = nil;
     end
+    if result == "timed out" then
+      self.timed_out = true
+    end
+    release_thread_runtime(self)
+  end
+
+  function Script:new_env (script_type, track_state)
+    if not track_state then
+      local env = {
+          SCRIPT_PATH = self.filename,
+          SCRIPT_NAME = self.short_basename,
+          SCRIPT_TYPE = script_type,
+      };
+      setmetatable(env, {__index = _G});
+      return env
+    end
+
+    local store = {}
+    local tracking = {store = store, dirty = false}
+    local env = setmetatable({}, {
+      __index = function (_, key)
+        local value = store[key]
+        if value ~= nil then
+          return value
+        end
+        return rawget(_G, key)
+      end,
+      __newindex = function (_, key, value)
+        store[key] = value
+        tracking.dirty = true
+      end,
+      __pairs = function ()
+        return pairs(store)
+      end,
+    })
+    store.SCRIPT_PATH = self.filename
+    store.SCRIPT_NAME = self.short_basename
+    store.SCRIPT_TYPE = script_type
+    return env, tracking
+  end
+
+  function Script:get_runtime_pool (script_type)
+    local pool = self.runtime_pools[script_type]
+    if not pool then
+      pool = RuntimePool.new(self, script_type)
+      self.runtime_pools[script_type] = pool
+    end
+    return pool
+  end
+
+  function Script:runtime_mode ()
+    if not RUNTIME_REUSE or self.runtime_isolated then
+      return "invocation"
+    elseif RUNTIME_STATE == "invocation" or self.declared_state_scope == "invocation" then
+      return "invocation"
+    elseif RUNTIME_STATE == "session" or self.declared_state_scope == "session" then
+      return "session"
+    end
+    return "auto"
+  end
+
+  function Script:fallback_to_isolation (reason)
+    if self.runtime_isolated then
+      return
+    end
+    self.runtime_isolated = true
+    runtime_stats.fallbacks = runtime_stats.fallbacks + 1
+    print_verbose(1, "NSE runtime isolation fallback: script=%s reason=%s",
+        self.short_basename, reason)
+    for _, pool in pairs(self.runtime_pools) do
+      pool:retire_idle()
+    end
+  end
+
+  function Thread:acquire_runtime ()
+    if self.runtime then
+      return
+    end
+    local runtime
+    if not self.worker and self.script:runtime_mode() ~= "invocation" then
+      runtime = self.script:get_runtime_pool(self.type):acquire()
+    end
+    if not runtime then
+      runtime = {
+        env = self.script:new_env(self.type),
+        last_used = time(),
+        output_order = {},
+        outputs = {},
+        prepared = false,
+        refs = 1,
+        reusable = false,
+        retired = false,
+        script = self.script,
+        script_type = self.type,
+        uses = 1,
+      }
+    end
+    self.runtime = runtime
+    self.env = runtime.env
   end
 
   -- thread = Script:new_thread(rule, ...)
@@ -467,43 +943,67 @@ do
   --   rule  The rule argument the rule, hostrule or portrule, tested.
   --   ...   The arguments passed to the rule function (host[, port]).
   -- Returns:
-  --   thread  The thread (class) is returned, or nil.
+  --   thread  (class) is returned, or nil.
   function Script:new_thread (rule, ...)
     local script_type = assert(NSE_SCRIPT_RULES[rule]);
     if not self[rule] then return nil end -- No rule for this script?
 
-    -- Rebuild the environment for the running thread.
-    local env = {
-        SCRIPT_PATH = self.filename,
-        SCRIPT_NAME = self.short_basename,
-        SCRIPT_TYPE = script_type,
-    };
-    setmetatable(env, {__index = _G});
+    local host_arg, port_arg = ...
     local forced = self.forced_to_run;
     local script_closure_generator = self.script_closure_generator;
+    local thread
     local function main (...)
-      local _ENV = env; -- change the environment
+      local runtime = thread.runtime
+      local prepared = runtime.prepared
+      local _ENV = runtime.env; -- change the environment
       cnse.install_thread_timer()
       -- TODO: install hooks
-      -- Load the script's globals in the same Lua thread the action and rule
-      -- functions will execute in.
-      script_closure_generator(_ENV)();
+      -- A pooled runtime has already executed the script's top level once.
+      -- One-shot runtimes retain the historical initialize-per-invocation
+      -- behavior, which also applies after an isolation fallback.
+      if not prepared then
+        runtime_stats.initializations = runtime_stats.initializations + 1
+        script_closure_generator(_ENV)();
+        runtime.prepared = true
+        if runtime.reusable and self:runtime_mode() == "auto" then
+          if runtime.tracking then
+            runtime.tracking.dirty = false
+          end
+          mark_shared_tables()
+          runtime.needs_state_fingerprint = runtime_has_mutable_state(runtime)
+          if runtime.needs_state_fingerprint then
+            runtime.baseline = runtime_state_fingerprint(runtime)
+            if runtime.baseline == nil then
+              runtime.retired = true
+              self:fallback_to_isolation("could not fingerprint script state")
+            end
+          end
+        end
+      end
       if forced or _ENV[rule](...) then
         yield(ACTION_STARTING)
-        return action(...)
+        return _ENV.action(...)
       end
     end
 
     local co = create(main);
-    local thread = {
+    local invocation_key = format("%s|%s|%s:%s", script_type,
+        host_arg and host_arg.ip or "",
+        port_arg and port_arg.number or "",
+        port_arg and port_arg.protocol or "")
+    thread = {
       action_started = false,
       args = pack(...),
       close_handlers = {},
       co = co,
-      env = env,
+      env = nil,
       identifier = tostring(co),
       info = format("%s M:%s", self.id, match(tostring(co), "^thread: 0?[xX]?(.*)"));
+      invocation_key = invocation_key,
+      output_signature = nil,
       parent = nil, -- placeholder
+      runtime = nil,
+      runtime_released = false,
       script = self,
       type = script_type,
       worker = false,
@@ -516,6 +1016,10 @@ do
 
   function Thread:new_worker (main, ...)
     local co = create(main);
+    local runtime = self.runtime
+    if runtime then
+      runtime.refs = runtime.refs + 1
+    end
     print_debug(2, "%s spawning new thread (%s).", self.parent.info, tostring(co));
     local thread = {
       args = pack(...),
@@ -523,6 +1027,8 @@ do
       co = co,
       info = format("%s W:%s", self.id, match(tostring(co), "^thread: 0?[xX]?(.*)"));
       parent = self,
+      runtime = runtime,
+      runtime_released = false,
       worker = true,
       start_time = 0,
     };
@@ -534,6 +1040,7 @@ do
   end
 
   function Thread:resume (timeouts)
+    self:acquire_runtime()
     cnse.start_thread_timer()
     local ok, r1, r2 = resume(self.co, unpack(self.args, 1, self.args.n));
     cnse.stop_thread_timer()
@@ -543,6 +1050,12 @@ do
       self.action_started = true
       return self:resume(timeouts);
     elseif not ok then
+      runtime_stats.execution_failures = runtime_stats.execution_failures + 1
+      local failure_message = tostring(type(r1) == "table" and r1.message or r1)
+      if find(failure_message, "exceeded time limit", 1, true) then
+        self.timed_out = true
+        runtime_stats.timeouts = runtime_stats.timeouts + 1
+      end
       -- Extend this to create new types of errors with custom handling.
       -- nmap.new_try does equivalent of: error({errtype="nmap.new_try", message="TIMEOUT"})
       if type(r1) == "table" and r1.errtype == "nmap.new_try" then
@@ -555,6 +1068,10 @@ do
         self:d("%THREAD_AGAINST threw an error!\n%s\n", traceback(self.co, tostring(r1)));
       else
         self:set_output("ERROR: Script execution failed (use -d to debug)");
+      end
+      if RUNTIME_REUSE then
+        print_verbose(1, "NSE script %s failed%s; continuing (%s)",
+            self.short_basename, against_name(self.host, self.port), failure_message)
       end
       self:close(timeouts, r1);
       return false
@@ -639,6 +1156,7 @@ do
     setmetatable(env, {__index = _G});
     local script_closure = script_closure_generator(env);
     local co = create(script_closure); -- Create a garbage thread
+    runtime_stats.initializations = runtime_stats.initializations + 1
     local status, e = resume(co); -- Get the globals it loads in env
     if not status then
       if quiet_errors[e] then
@@ -682,6 +1200,11 @@ do
       assert(type(dependency) == "string",
         filename.." has non-string entries in the 'dependencies' array");
     end
+    local declared_state_scope = rawget(env, "state_scope") or "auto"
+    if declared_state_scope ~= "auto" and declared_state_scope ~= "session" and
+        declared_state_scope ~= "invocation" then
+      error(filename.." field 'state_scope' must be \"auto\", \"session\", or \"invocation\"");
+    end
     -- Return the script
     local script = {
       filename = filename,
@@ -699,6 +1222,9 @@ do
       author = rawget(env, "author"),
       license = rawget(env, "license"),
       dependencies = rawget(env, "dependencies"),
+      declared_state_scope = declared_state_scope,
+      runtime_isolated = false,
+      runtime_pools = {},
       threads = {},
       -- Make sure that the following are boolean types.
       selected_by_name = not not script_params.verbosity,
@@ -1069,6 +1595,7 @@ local function run (threads_iter)
     for co, thread in pairs(waiting) do
       if thread:timed_out() then
         waiting[co], all[co], num_threads = nil, nil, num_threads-1;
+        runtime_stats.timeouts = runtime_stats.timeouts + 1
         thread:d("%THREAD_AGAINST timed out")
         thread:close(timeouts, "timed out");
       elseif not thread.worker then
@@ -1118,7 +1645,7 @@ end
 -- value is shown; then string keys are shown prefixed by the key and a colon.
 -- Any other kinds of keys. Anything that is not a table is converted to a
 -- string with tostring.
-local function format_table(obj, indent)
+function format_table (obj, indent)
   indent = indent or "  ";
   if type(obj) == "table" then
     local mt = getmetatable(obj)
@@ -1505,6 +2032,10 @@ local function main (hosts, scantype)
   end
 
   collectgarbage "collect";
+  sweep_all_runtimes();
+  if scantype == NSE_POST_SCAN then
+    print_runtime_stats();
+  end
 end
 
 return main;

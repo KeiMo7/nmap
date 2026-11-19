@@ -2849,6 +2849,49 @@ for that host.</para>
 
       <varlistentry>
         <term>
+          <option>--script-runtime-reuse</option>
+          <indexterm><primary><option>--script-runtime-reuse</option></primary></indexterm>
+        </term>
+        <listitem>
+          <para>Enable reuse of initialized NSE script runtimes across script
+          invocations. Script code is loaded once per execution context and
+          repeated calls can skip script top-level initialization. The default
+          is off, preserving the historical one-environment-per-invocation
+          behavior.</para>
+        </listitem>
+      </varlistentry>
+
+      <varlistentry>
+        <term>
+          <option>--script-runtime-idle-timeout <replaceable>time</replaceable></option>
+          <indexterm><primary><option>--script-runtime-idle-timeout</option></primary></indexterm>
+        </term>
+        <listitem>
+          <para>Destroy reused script runtimes that have been idle longer than
+          this threshold. The default is 60 seconds. Reclamations are logged
+          when verbosity or debugging output is enabled.</para>
+        </listitem>
+      </varlistentry>
+
+      <varlistentry>
+        <term>
+          <option>--script-runtime-state
+          <replaceable>auto|session|invocation</replaceable></option>
+          <indexterm><primary><option>--script-runtime-state</option></primary></indexterm>
+        </term>
+        <listitem>
+          <para>Select the lifetime of script globals in reuse mode.
+          <literal>auto</literal> reuses a runtime until a script global
+          changes, then falls back to isolated execution for that script.
+          <literal>session</literal> keeps global state across calls that
+          lease the same runtime for the duration of the scan.
+          <literal>invocation</literal> initializes a fresh environment for
+          every call. The default is <literal>auto</literal>.</para>
+        </listitem>
+      </varlistentry>
+
+      <varlistentry>
+        <term>
         <option>--scan-delay <replaceable>time</replaceable></option>;
         <option>--max-scan-delay
         <replaceable>time</replaceable></option> (Adjust delay between probes)

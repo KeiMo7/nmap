@@ -449,6 +449,9 @@ uninstall-nping:
 check-nse:
 	./nmap -d --datadir . --script=unittest --script-args=unittest.run --release-mem
 
+check-nse-runtime: nmap
+	sh ./tests/nse_runtime_reuse_test.sh
+
 check-ncat:
 	@cd $(NCATDIR) && $(MAKE) check
 
